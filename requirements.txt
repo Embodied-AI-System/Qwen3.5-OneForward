@@ -1,0 +1,6 @@
+accelerate>=1.4,<2
+fastapi>=0.115,<1
+safetensors>=0.5,<1
+torch>=2.6,<3
+transformers>=5.2,<6
+uvicorn[standard]>=0.30,<1

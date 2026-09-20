@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OneForward · Qwen3.5 Typed Decisions</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="eyebrow">QWEN3.5-2B · ONE FORWARD · ZERO DECODE</div>
+        <h1>OneForward</h1>
+        <p>Map arbitrary semantic options to single tokens, then read the next-token logits directly.</p>
+        <div id="status" class="status">Model status: connecting…</div>
+      </header>
+
+      <section class="panel form-panel">
+        <label>
+          <span>State</span>
+          <textarea id="state" rows="5">Customer says the integration keeps failing. Please help ASAP.</textarea>
+        </label>
+        <label>
+          <span>Question</span>
+          <input id="question" value="Which team should handle this?" />
+        </label>
+        <div class="options-heading">
+          <span>Options</span>
+          <button id="add-option" class="secondary" type="button">＋ Add option</button>
+        </div>
+        <div id="options"></div>
+        <button id="run" class="run" type="button">Run one-forward decision</button>
+        <div id="error" class="error" hidden></div>
+      </section>
+
+      <section id="results" class="panel results" hidden>
+        <div class="result-title">
+          <div>
+            <div class="eyebrow">DECISION</div>
+            <h2 id="choice"></h2>
+          </div>
+          <div id="latency" class="latency"></div>
+        </div>
+        <div id="bars"></div>
+        <div class="metrics">
+          <div><span>candidate mass</span><strong id="mass"></strong></div>
+          <div><span>experimental confidence</span><strong id="confidence"></strong></div>
+          <div><span>input tokens</span><strong id="tokens"></strong></div>
+        </div>
+        <details>
+          <summary>Research debug data</summary>
+          <div class="debug-grid">
+            <div><h3>Candidate readout</h3><pre id="readout"></pre></div>
+            <div><h3>Top vocabulary tokens</h3><pre id="top-vocab"></pre></div>
+          </div>
+          <h3>Rendered prompt</h3>
+          <pre id="prompt"></pre>
+          <h3>Full response</h3>
+          <pre id="response"></pre>
+        </details>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
