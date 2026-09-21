@@ -7,7 +7,14 @@ from inference import DecisionResult
 
 
 class FakeBackend:
-    def score_choice(self, state, instructions, criteria):
+    def __init__(self):
+        self.last_media = ()
+
+    def prepare_media(self, items):
+        return tuple({"type": item.type, "name": item.name} for item in items)
+
+    def score_choice(self, state, instructions, criteria, media=()):
+        self.last_media = media
         return DecisionResult(
             probabilities=(0.1, 0.8, 0.1),
             selected_index=1,
@@ -32,7 +39,8 @@ class FakeBackend:
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.client_context = TestClient(create_app(FakeBackend()))
+        self.backend = FakeBackend()
+        self.client_context = TestClient(create_app(self.backend))
         self.client = self.client_context.__enter__()
 
     def tearDown(self):
@@ -89,6 +97,49 @@ class ApiTests(unittest.TestCase):
                         "type": "choice",
                         "instructions": "q",
                         "criteria": {"only": "one"},
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_multimodal_media_is_prepared_and_forwarded(self):
+        response = self.client.post(
+            "/v1/systemone",
+            json={
+                "state": "inspect",
+                "media": [{
+                    "type": "image",
+                    "name": "pixel.png",
+                    "data_url": "data:image/png;base64,AAAAAAAA",
+                }],
+                "questions": {
+                    "decision": {
+                        "type": "choice",
+                        "instructions": "pick",
+                        "criteria": {"red": "red", "blue": "blue"},
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.backend.last_media[0]["type"], "image")
+        self.assertEqual(response.json()["_debug"]["media_count"], 1)
+
+    def test_rejects_more_than_one_video(self):
+        response = self.client.post(
+            "/v1/systemone",
+            json={
+                "state": "inspect",
+                "media": [
+                    {"type": "video", "data_url": "data:video/mp4;base64,AAAAAAAA"},
+                    {"type": "video", "data_url": "data:video/mp4;base64,AAAAAAAA"},
+                ],
+                "questions": {
+                    "decision": {
+                        "type": "choice",
+                        "instructions": "pick",
+                        "criteria": {"a": "a", "b": "b"},
                     }
                 },
             },

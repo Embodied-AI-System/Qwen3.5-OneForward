@@ -37,6 +37,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(decision.candidate_token_ids, (357, 417))
         self.assertTrue(decision.prompt.endswith("Answer:"))
 
+    def test_multimodal_messages_use_structured_content(self):
+        renderer = PromptRenderer(self.tokenizer, "chat")
+        messages = renderer.messages(
+            "decision body", [{"type": "image", "image": "fixture"}]
+        )
+        self.assertEqual(messages[0]["content"][0]["type"], "text")
+        self.assertEqual(messages[1]["content"][0]["type"], "image")
+        self.assertEqual(messages[1]["content"][-1]["text"], "decision body")
+
     def test_normalized_entropy_confidence(self):
         self.assertAlmostEqual(normalized_entropy_confidence((0.5, 0.5)), 0.0)
         self.assertAlmostEqual(normalized_entropy_confidence((1.0, 0.0)), 1.0)

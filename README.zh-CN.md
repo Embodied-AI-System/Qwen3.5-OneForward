@@ -4,7 +4,7 @@
 
 [English](README.md) · [API 示例](#api) · [实现原理](#实现原理) · [能力边界](#能力边界)
 
-OneForward 将未经修改的开源权重
+OneForward 将文本、图片和视频交给未经修改的开源权重
 [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) 包装成一个小型的
 Jev 风格决策服务。它动态构造 prompt，把用户定义的选项映射到单 token
 标签 `A`–`H`，每个 Choice 问题只执行一次模型 forward，随后直接摘取下一
@@ -21,6 +21,8 @@ token 的 logits。整个过程没有生成式解码、采样、微调、adapter
 
 - **无需额外训练**：原样使用上游 Qwen3.5-2B 权重。
 - **不生成答案**：每个问题一次 forward，返回 `output_tokens: 0`。
+- **原生多模态证据**：每次请求最多加入 8 张图片或 1 个视频，视觉编码器与
+  决策 prompt 共同参与同一次 forward。
 - **选项运行时定义**：请求中直接给出选项名称与语义，无固定分类头。
 - **直接返回概率**：对允许的标签 token logits 做 softmax，无需解析生成文本。
 - **过程透明**：`_debug` 提供候选 logits、token ID、candidate mass、完整 prompt
@@ -81,12 +83,20 @@ JEV_MODEL_PATH=/absolute/path/to/Qwen3.5-2B ./run.sh
 
 ## API
 
+顶层 `media` 字段可选，所以原有纯文本客户端保持兼容。多模态请求用 base64
+data URL 传入图片或视频：
+
 ```bash
 curl http://127.0.0.1:8000/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{
     "state": "Customer says the integration keeps failing. Please help ASAP.",
     "model": "jev-latest",
+    "media": [{
+      "type": "image",
+      "name": "scene.png",
+      "data_url": "data:image/png;base64,..."
+    }],
     "questions": {
       "department": {
         "type": "choice",
@@ -105,6 +115,11 @@ curl http://127.0.0.1:8000/v1/systemone \
 `candidate_mass` 为 `0.999844`，且 `output_tokens` 为 `0`。完整返回示例见
 [英文 README](README.md#api)。
 
+网页支持选择或拖拽文件并直接预览。API 支持 PNG、JPEG、WebP、GIF、MP4、
+WebM、MOV、MKV 和 AVI。单张图片上限 16 MiB；视频上限 64 MiB、180 秒，
+默认按 1 FPS 且最多 32 帧采样。服务只在本地解码，返回值不会回显 base64，
+`_debug.media` 只包含尺寸、字节数、时长和采样帧数。
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -113,6 +128,9 @@ curl http://127.0.0.1:8000/v1/systemone \
 | `JEV_DEVICE` | 有 CUDA 时为 `cuda`，否则 `cpu` | PyTorch 设备 |
 | `JEV_PROMPT_MODE` | `chat` | `chat` 使用官方模板；`raw` 使用 `Answer:` 补全模板 |
 | `JEV_TEMPERATURE` | `1.0` | 只缩放候选 logits，不会触发采样 |
+| `JEV_MAX_INPUT_TOKENS` | `8192` | 文本与视觉 token 的总上限 |
+| `JEV_VIDEO_FPS` | `1.0` | 视频目标采样率 |
+| `JEV_MAX_VIDEO_FRAMES` | `32` | 每个视频最多采样帧数 |
 | `JEV_HOST` | `127.0.0.1` | 监听地址 |
 | `JEV_PORT` | `8000` | HTTP 端口 |
 | `JEV_PYTHON` | `python3` | `run.sh` 使用的 Python |
@@ -121,7 +139,7 @@ curl http://127.0.0.1:8000/v1/systemone \
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -v
-python -m compileall -q app.py core.py inference.py tests scripts
+python -m compileall -q app.py core.py inference.py media.py tests scripts
 ```
 
 服务启动后可以执行真实模型 smoke test：
@@ -141,7 +159,8 @@ python -m compileall -q app.py core.py inference.py tests scripts
 ## 能力边界
 
 - 当前仅支持 2–8 个选项的 Choice；不支持 Noul、Score 或更大候选集。
-- 当前只接收文本，尚未使用 Qwen3.5-2B 的多模态能力。
+- 多模态输入需要默认的 chat prompt 模式；raw `Answer:` 基线仍只支持文本。
+- 每次请求最多 8 个媒体附件且最多 1 个视频；视频会抽帧，音频不会输入模型。
 - 多问题按顺序执行，暂未实现 batch 或共享 prefix cache。
 - 选项概率是允许标签集合内的条件概率，不是“答案正确”的校准概率。
 - `confidence = 1 - normalized_entropy(probabilities)` 只是实验性启发式公式，

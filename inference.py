@@ -10,9 +10,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from core import PromptRenderer, normalized_entropy_confidence
+from media import MediaInputError, PreparedMedia, prepare_media
 
 
 DEFAULT_MODEL_PATH = "Qwen/Qwen3.5-2B"
+
+
+class InputTooLongError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,7 @@ class DecisionResult:
     input_tokens: int
     inference_ms: float
     top_vocabulary: tuple[dict[str, Any], ...]
+    media: tuple[dict[str, Any], ...] = ()
 
 
 class HFLogitBackend:
@@ -41,12 +47,20 @@ class HFLogitBackend:
         device: str | None = None,
         prompt_mode: str = "chat",
         temperature: float = 1.0,
+        max_input_tokens: int = 8192,
+        video_fps: float = 1.0,
+        max_video_frames: int = 32,
     ) -> None:
         if temperature <= 0:
             raise ValueError("temperature must be positive")
 
+        if max_input_tokens < 128:
+            raise ValueError("max_input_tokens must be at least 128")
+        if video_fps <= 0 or max_video_frames < 1:
+            raise ValueError("video sampling configuration must be positive")
+
         import torch
-        from transformers import AutoModelForImageTextToText, AutoTokenizer
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         self.torch = torch
         expanded_source = os.path.expanduser(model_path)
@@ -64,13 +78,17 @@ class HFLogitBackend:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.temperature = temperature
         self.prompt_mode = prompt_mode
+        self.max_input_tokens = max_input_tokens
+        self.video_fps = video_fps
+        self.max_video_frames = max_video_frames
         self._lock = threading.Lock()
 
         started = time.perf_counter()
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(
             self.model_source,
             local_files_only=self.is_local_model,
         )
+        self.tokenizer = self.processor.tokenizer
         dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.model = AutoModelForImageTextToText.from_pretrained(
             self.model_source,
@@ -98,6 +116,18 @@ class HFLogitBackend:
             device=os.environ.get("JEV_DEVICE") or None,
             prompt_mode=os.environ.get("JEV_PROMPT_MODE", "chat"),
             temperature=float(os.environ.get("JEV_TEMPERATURE", "1.0")),
+            max_input_tokens=int(os.environ.get("JEV_MAX_INPUT_TOKENS", "8192")),
+            video_fps=float(os.environ.get("JEV_VIDEO_FPS", "1.0")),
+            max_video_frames=int(os.environ.get("JEV_MAX_VIDEO_FRAMES", "32")),
+        )
+
+    def prepare_media(self, items: Sequence[Any]) -> tuple[PreparedMedia, ...]:
+        if items and self.prompt_mode != "chat":
+            raise MediaInputError("multimodal input requires JEV_PROMPT_MODE=chat")
+        return prepare_media(
+            items,
+            video_fps=self.video_fps,
+            max_video_frames=self.max_video_frames,
         )
 
     def score_choice(
@@ -105,13 +135,60 @@ class HFLogitBackend:
         state: Any,
         instructions: Any,
         criteria: Sequence[tuple[str, str]],
+        media: Sequence[PreparedMedia] = (),
     ) -> DecisionResult:
         torch = self.torch
         rendered = self.renderer.render(state, instructions, criteria)
-        input_ids = torch.tensor(
-            [rendered.input_ids], dtype=torch.long, device=self.device
-        )
-        attention_mask = torch.ones_like(input_ids)
+        prompt = rendered.prompt
+        if media:
+            body = self.renderer.render_body(state, instructions, criteria)
+            messages = self.renderer.messages(
+                body, [attachment.content_block() for attachment in media]
+            )
+            video_metadata = [
+                attachment.video_metadata
+                for attachment in media
+                if attachment.video_metadata is not None
+            ]
+            processor_kwargs: dict[str, Any] = {}
+            if video_metadata:
+                processor_kwargs = {
+                    "do_sample_frames": False,
+                    "video_metadata": video_metadata,
+                }
+            model_inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs=processor_kwargs,
+            )
+            prompt = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            model_inputs = {
+                key: value.to(self.device) if hasattr(value, "to") else value
+                for key, value in model_inputs.items()
+            }
+            input_ids = model_inputs["input_ids"]
+        else:
+            input_ids = torch.tensor(
+                [rendered.input_ids], dtype=torch.long, device=self.device
+            )
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+            }
+        input_token_count = int(input_ids.shape[-1])
+        if input_token_count > self.max_input_tokens:
+            raise InputTooLongError(
+                f"rendered prompt has {input_token_count} tokens; limit is {self.max_input_tokens}"
+            )
 
         # Serialize access: the MVP deliberately evaluates questions independently.
         with self._lock, torch.inference_mode():
@@ -119,8 +196,7 @@ class HFLogitBackend:
                 torch.cuda.synchronize()
             started = time.perf_counter()
             output = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                **model_inputs,
                 logits_to_keep=1,
                 use_cache=False,
             )
@@ -163,10 +239,11 @@ class HFLogitBackend:
             raw_logits=tuple(float(value) for value in candidate_logits.tolist()),
             candidate_tokens=rendered.candidate_tokens,
             candidate_token_ids=rendered.candidate_token_ids,
-            prompt=rendered.prompt,
-            input_tokens=len(rendered.input_ids),
+            prompt=prompt,
+            input_tokens=input_token_count,
             inference_ms=inference_ms,
             top_vocabulary=top_vocabulary,
+            media=tuple(attachment.public_metadata() for attachment in media),
         )
 
     def status(self) -> dict[str, Any]:
@@ -180,4 +257,12 @@ class HFLogitBackend:
             "temperature": self.temperature,
             "load_seconds": self.load_seconds,
             "max_options": 8,
+            "max_input_tokens": self.max_input_tokens,
+            "multimodal": True,
+            "media_limits": {
+                "attachments": 8,
+                "videos": 1,
+                "video_fps": self.video_fps,
+                "max_video_frames": self.max_video_frames,
+            },
         }

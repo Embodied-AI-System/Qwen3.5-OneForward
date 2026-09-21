@@ -9,7 +9,7 @@
 
 [简体中文](README.zh-CN.md) · [API example](#api) · [How it works](#how-it-works) · [Limitations](#scope-and-limitations)
 
-OneForward turns the unchanged, open-weight
+OneForward turns text, images, and video into typed decisions with the unchanged, open-weight
 [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) checkpoint into a small
 Jev-style decision service. It constructs a prompt, maps user-defined options to
 single-token labels (`A`–`H`), runs exactly one model forward pass for each
@@ -30,6 +30,8 @@ loop, sampling, fine-tuning, adapter, or task-specific checkpoint.
 - **No additional training.** It uses the upstream Qwen3.5-2B weights unchanged.
 - **No generated answer.** A request performs one prefill/forward per question and
   returns `output_tokens: 0`.
+- **Native visual evidence.** Attach up to eight images or one video; Qwen's vision
+  encoder participates in the same forward pass as the decision prompt.
 - **Runtime-defined labels.** Your option names and descriptions are supplied in
   the request; there is no fixed classifier head.
 - **Probabilities, not parsed text.** A softmax over the allowed label logits gives
@@ -101,12 +103,20 @@ JEV_MODEL_PATH=/absolute/path/to/Qwen3.5-2B ./run.sh
 
 ## API
 
+The top-level `media` field is optional, so existing text-only clients continue
+to work. Multimodal clients provide base64 data URLs:
+
 ```bash
 curl http://127.0.0.1:8000/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{
     "state": "Customer says the integration keeps failing. Please help ASAP.",
     "model": "jev-latest",
+    "media": [{
+      "type": "image",
+      "name": "scene.png",
+      "data_url": "data:image/png;base64,..."
+    }],
     "questions": {
       "department": {
         "type": "choice",
@@ -154,6 +164,13 @@ Example response, abbreviated from a real BF16 run:
 Multiple Choice questions are accepted in one request, but this first version
 evaluates them sequentially—one model forward per question.
 
+The browser playground supports selecting or dragging files with inline preview.
+The API accepts PNG, JPEG, WebP, GIF, MP4, WebM, MOV, MKV, and AVI data URLs.
+Images are limited to 16 MiB each. Video is limited to 64 MiB and 180 seconds,
+sampled at 1 FPS with a 32-frame cap. Base64 content is decoded locally and is
+never echoed in responses; only dimensions, byte size, duration, and sampled
+frame count appear under `_debug.media`.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -162,6 +179,9 @@ evaluates them sequentially—one model forward per question.
 | `JEV_DEVICE` | `cuda` when available, otherwise `cpu` | PyTorch device |
 | `JEV_PROMPT_MODE` | `chat` | `chat` uses Qwen's template; `raw` uses an `Answer:` completion prompt |
 | `JEV_TEMPERATURE` | `1.0` | Rescales candidate logits; no sampling is performed |
+| `JEV_MAX_INPUT_TOKENS` | `8192` | Maximum text-plus-vision token count |
+| `JEV_VIDEO_FPS` | `1.0` | Target video sampling rate |
+| `JEV_MAX_VIDEO_FRAMES` | `32` | Maximum sampled frames per video |
 | `JEV_HOST` | `127.0.0.1` | Bind address |
 | `JEV_PORT` | `8000` | HTTP port |
 | `JEV_PYTHON` | `python3` | Python executable used by `run.sh` |
@@ -170,7 +190,7 @@ evaluates them sequentially—one model forward per question.
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -v
-python -m compileall -q app.py core.py inference.py tests scripts
+python -m compileall -q app.py core.py inference.py media.py tests scripts
 ```
 
 After starting the server, run the real-model smoke request:
@@ -194,7 +214,10 @@ post-training, RL, distillation, or calibration.
 
 - Choice only, with 2–8 options. Noul, Score, and larger option sets are not
   implemented.
-- Text input only, even though Qwen3.5-2B is multimodal.
+- Multimodal input requires chat prompt mode; the raw `Answer:` baseline remains
+  text-only.
+- Each request accepts up to eight attachments and at most one video. Video is
+  frame-sampled and audio is ignored.
 - Questions are not batched and do not share a prefix cache.
 - Candidate probabilities are conditional on the allowed labels and are not
   calibrated correctness probabilities.
@@ -214,6 +237,7 @@ without domain-specific evaluation and human safeguards.
 app.py              FastAPI request/response layer
 core.py             prompt rendering and probability utilities
 inference.py        Qwen loading and final-position logits readout
+media.py            validated data-URL decoding and bounded video sampling
 web/                local research playground
 tests/              schema and tokenizer-invariant tests
 scripts/smoke_test.py

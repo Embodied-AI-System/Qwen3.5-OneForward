@@ -52,24 +52,11 @@ class PromptRenderer:
             raise ValueError(f"choice must have 2 to {len(LETTERS)} options")
 
         labels = LETTERS[: len(criteria)]
-        option_lines = [
-            f"{letter}. {name}: {description}"
-            for letter, (name, description) in zip(labels, criteria)
-        ]
-        body = (
-            f"State:\n{render_value(state)}\n\n"
-            f"Question:\n{render_value(instructions)}\n\n"
-            f"Options:\n" + "\n".join(option_lines) + "\n\n"
-            f"Return exactly one option letter from {', '.join(labels)}."
-        )
+        body = self.render_body(state, instructions, criteria)
 
         if self.mode == "chat":
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": body},
-            ]
             prompt = self.tokenizer.apply_chat_template(
-                messages,
+                self.messages(body),
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
@@ -113,6 +100,40 @@ class PromptRenderer:
             candidate_token_ids=tuple(candidate_token_ids),
             input_ids=input_ids,
         )
+
+    def render_body(
+        self,
+        state: Any,
+        instructions: Any,
+        criteria: Sequence[tuple[str, str]],
+    ) -> str:
+        labels = LETTERS[: len(criteria)]
+        option_lines = [
+            f"{letter}. {name}: {description}"
+            for letter, (name, description) in zip(labels, criteria)
+        ]
+        return (
+            f"State:\n{render_value(state)}\n\n"
+            f"Question:\n{render_value(instructions)}\n\n"
+            f"Options:\n" + "\n".join(option_lines) + "\n\n"
+            f"Return exactly one option letter from {', '.join(labels)}."
+        )
+
+    def messages(
+        self,
+        body: str,
+        media_blocks: Sequence[dict[str, Any]] = (),
+    ) -> list[dict[str, Any]]:
+        if media_blocks:
+            system_content: Any = [{"type": "text", "text": self.system_prompt}]
+            user_content: Any = [*media_blocks, {"type": "text", "text": body}]
+        else:
+            system_content = self.system_prompt
+            user_content = body
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
 
 
 def normalized_entropy_confidence(probabilities: Sequence[float]) -> float:

@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OneForward · Qwen3.5 Typed Decisions</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23121815'/%3E%3Cpath d='M14 42 25 16h8L22 42Zm18 0 11-26h8L40 42Z' fill='%23a8ff60'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
@@ -20,6 +21,18 @@
           <span>State</span>
           <textarea id="state" rows="5">Customer says the integration keeps failing. Please help ASAP.</textarea>
         </label>
+        <section class="media-field" aria-labelledby="media-title">
+          <div class="media-heading">
+            <div>
+              <span id="media-title">Visual evidence</span>
+              <small>Up to 8 images or 1 video · video sampled at 1 FPS, max 32 frames</small>
+            </div>
+            <button id="add-media" class="secondary" type="button">＋ Add image / video</button>
+          </div>
+          <input id="media-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-matroska" multiple hidden />
+          <button id="media-dropzone" class="media-dropzone" type="button">Drop images or video here, or click to browse</button>
+          <div id="media-list" class="media-list" aria-live="polite"></div>
+        </section>
         <label>
           <span>Question</span>
           <input id="question" value="Which team should handle this?" />
