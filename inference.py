@@ -36,6 +36,31 @@ class DecisionResult:
     media: tuple[dict[str, Any], ...] = ()
 
 
+@dataclass(frozen=True)
+class BatchResult:
+    decisions: tuple[DecisionResult, ...]
+    batch_size: int
+    inference_ms: float
+    queue_ms: float
+    preprocess_ms: float
+    shared_prefix_tokens: int
+    max_input_tokens: int
+    total_input_tokens: int
+    padded_input_tokens: int
+    padding_tokens: int
+
+
+def _common_prefix_length(rows: Sequence[Sequence[int]]) -> int:
+    if not rows:
+        return 0
+    limit = min(len(row) for row in rows)
+    for index in range(limit):
+        value = rows[0][index]
+        if any(row[index] != value for row in rows[1:]):
+            return index
+    return limit
+
+
 class HFLogitBackend:
     """Loads Qwen once and reads only the final-position vocabulary logits."""
 
@@ -137,27 +162,57 @@ class HFLogitBackend:
         criteria: Sequence[tuple[str, str]],
         media: Sequence[PreparedMedia] = (),
     ) -> DecisionResult:
+        batch = self.score_batch(
+            state,
+            ({"instructions": instructions, "criteria": criteria},),
+            media=media,
+        )
+        return batch.decisions[0]
+
+    def score_batch(
+        self,
+        state: Any,
+        jobs: Sequence[dict[str, Any]],
+        *,
+        media: Sequence[PreparedMedia] = (),
+    ) -> BatchResult:
+        """Score shared-state Choice questions in one padded model forward."""
+        if not jobs:
+            raise ValueError("score_batch requires at least one question")
         torch = self.torch
-        rendered = self.renderer.render(state, instructions, criteria)
-        prompt = rendered.prompt
+        preprocess_started = time.perf_counter()
+        rendered_batch = [
+            self.renderer.render(state, job["instructions"], job["criteria"])
+            for job in jobs
+        ]
+        prompts = [rendered.prompt for rendered in rendered_batch]
         if media:
-            body = self.renderer.render_body(state, instructions, criteria)
-            messages = self.renderer.messages(
-                body, [attachment.content_block() for attachment in media]
-            )
+            conversations = [
+                self.renderer.messages(
+                    self.renderer.render_body(
+                        state, job["instructions"], job["criteria"]
+                    ),
+                    [attachment.content_block() for attachment in media],
+                )
+                for job in jobs
+            ]
             video_metadata = [
                 attachment.video_metadata
+                for _ in jobs
                 for attachment in media
                 if attachment.video_metadata is not None
             ]
-            processor_kwargs: dict[str, Any] = {}
+            processor_kwargs: dict[str, Any] = {
+                "padding": True,
+                "padding_side": "left",
+            }
             if video_metadata:
-                processor_kwargs = {
-                    "do_sample_frames": False,
-                    "video_metadata": video_metadata,
-                }
+                processor_kwargs.update(
+                    do_sample_frames=False,
+                    video_metadata=video_metadata,
+                )
             model_inputs = self.processor.apply_chat_template(
-                messages,
+                conversations,
                 tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=False,
@@ -165,85 +220,131 @@ class HFLogitBackend:
                 return_tensors="pt",
                 processor_kwargs=processor_kwargs,
             )
-            prompt = self.processor.apply_chat_template(
-                messages,
+            prompts = self.processor.apply_chat_template(
+                conversations,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
-            model_inputs = {
-                key: value.to(self.device) if hasattr(value, "to") else value
-                for key, value in model_inputs.items()
-            }
-            input_ids = model_inputs["input_ids"]
         else:
-            input_ids = torch.tensor(
-                [rendered.input_ids], dtype=torch.long, device=self.device
+            input_lengths = [len(rendered.input_ids) for rendered in rendered_batch]
+            maximum = max(input_lengths)
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                raise RuntimeError("tokenizer has no pad token for batched inference")
+            input_ids = torch.full(
+                (len(rendered_batch), maximum),
+                int(pad_token_id),
+                dtype=torch.long,
             )
+            attention_mask = torch.zeros_like(input_ids)
+            for index, rendered in enumerate(rendered_batch):
+                length = len(rendered.input_ids)
+                input_ids[index, -length:] = torch.tensor(
+                    rendered.input_ids, dtype=torch.long
+                )
+                attention_mask[index, -length:] = 1
             model_inputs = {
                 "input_ids": input_ids,
-                "attention_mask": torch.ones_like(input_ids),
+                "attention_mask": attention_mask,
             }
-        input_token_count = int(input_ids.shape[-1])
-        if input_token_count > self.max_input_tokens:
+
+        model_inputs = {
+            key: value.to(self.device) if hasattr(value, "to") else value
+            for key, value in model_inputs.items()
+        }
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        input_lengths = [int(value) for value in attention_mask.sum(dim=1).tolist()]
+        longest_input = max(input_lengths)
+        if longest_input > self.max_input_tokens:
             raise InputTooLongError(
-                f"rendered prompt has {input_token_count} tokens; limit is {self.max_input_tokens}"
+                f"rendered prompt has {longest_input} tokens; limit is {self.max_input_tokens}"
             )
+        token_rows = [
+            input_ids[index][attention_mask[index].bool()].tolist()
+            for index in range(len(jobs))
+        ]
+        shared_prefix_tokens = _common_prefix_length(token_rows)
+        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
 
-        # Serialize access: the MVP deliberately evaluates questions independently.
-        with self._lock, torch.inference_mode():
-            if self.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            started = time.perf_counter()
-            output = self.model(
-                **model_inputs,
-                logits_to_keep=1,
-                use_cache=False,
+        queued_at = time.perf_counter()
+        with self._lock:
+            acquired_at = time.perf_counter()
+            with torch.inference_mode():
+                if self.device.startswith("cuda"):
+                    torch.cuda.synchronize()
+                started = time.perf_counter()
+                output = self.model(
+                    **model_inputs,
+                    logits_to_keep=1,
+                    use_cache=False,
+                )
+                if self.device.startswith("cuda"):
+                    torch.cuda.synchronize()
+                inference_ms = (time.perf_counter() - started) * 1000.0
+        queue_ms = (acquired_at - queued_at) * 1000.0
+
+        decisions: list[DecisionResult] = []
+        media_metadata = tuple(attachment.public_metadata() for attachment in media)
+        for batch_index, (rendered, prompt, input_token_count) in enumerate(
+            zip(rendered_batch, prompts, input_lengths)
+        ):
+            vocabulary_logits = output.logits[batch_index, -1].float() / self.temperature
+            token_index = torch.tensor(
+                rendered.candidate_token_ids,
+                dtype=torch.long,
+                device=vocabulary_logits.device,
             )
-            if self.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            inference_ms = (time.perf_counter() - started) * 1000.0
+            candidate_logits = vocabulary_logits.index_select(0, token_index)
+            probabilities = torch.softmax(candidate_logits, dim=0)
+            candidate_mass = torch.exp(
+                torch.logsumexp(candidate_logits, dim=0)
+                - torch.logsumexp(vocabulary_logits, dim=0)
+            )
+            selected_index = int(torch.argmax(candidate_logits).item())
+            top_values, top_ids = torch.topk(
+                torch.softmax(vocabulary_logits, dim=0), k=8
+            )
+            top_vocabulary = tuple(
+                {
+                    "token": self.tokenizer.decode([int(token_id)]),
+                    "token_id": int(token_id),
+                    "probability": float(value),
+                }
+                for value, token_id in zip(top_values.tolist(), top_ids.tolist())
+            )
+            probability_values = tuple(float(value) for value in probabilities.tolist())
+            decisions.append(DecisionResult(
+                probabilities=probability_values,
+                selected_index=selected_index,
+                confidence=normalized_entropy_confidence(probability_values),
+                candidate_mass=float(candidate_mass.item()),
+                raw_logits=tuple(float(value) for value in candidate_logits.tolist()),
+                candidate_tokens=rendered.candidate_tokens,
+                candidate_token_ids=rendered.candidate_token_ids,
+                prompt=prompt,
+                input_tokens=input_token_count,
+                inference_ms=inference_ms,
+                top_vocabulary=top_vocabulary,
+                media=media_metadata,
+            ))
 
-        vocabulary_logits = output.logits[0, -1].float() / self.temperature
-        token_index = torch.tensor(
-            rendered.candidate_token_ids,
-            dtype=torch.long,
-            device=vocabulary_logits.device,
-        )
-        candidate_logits = vocabulary_logits.index_select(0, token_index)
-        probabilities = torch.softmax(candidate_logits, dim=0)
-        candidate_mass = torch.exp(
-            torch.logsumexp(candidate_logits, dim=0)
-            - torch.logsumexp(vocabulary_logits, dim=0)
-        )
-        selected_index = int(torch.argmax(candidate_logits).item())
-
-        top_values, top_ids = torch.topk(
-            torch.softmax(vocabulary_logits, dim=0), k=8
-        )
-        top_vocabulary = tuple(
-            {
-                "token": self.tokenizer.decode([int(token_id)]),
-                "token_id": int(token_id),
-                "probability": float(value),
-            }
-            for value, token_id in zip(top_values.tolist(), top_ids.tolist())
-        )
-        probability_values = tuple(float(value) for value in probabilities.tolist())
-
-        return DecisionResult(
-            probabilities=probability_values,
-            selected_index=selected_index,
-            confidence=normalized_entropy_confidence(probability_values),
-            candidate_mass=float(candidate_mass.item()),
-            raw_logits=tuple(float(value) for value in candidate_logits.tolist()),
-            candidate_tokens=rendered.candidate_tokens,
-            candidate_token_ids=rendered.candidate_token_ids,
-            prompt=prompt,
-            input_tokens=input_token_count,
+        total_input_tokens = sum(input_lengths)
+        padded_input_tokens = int(input_ids.numel())
+        return BatchResult(
+            decisions=tuple(decisions),
+            batch_size=len(decisions),
             inference_ms=inference_ms,
-            top_vocabulary=top_vocabulary,
-            media=tuple(attachment.public_metadata() for attachment in media),
+            queue_ms=queue_ms,
+            preprocess_ms=preprocess_ms,
+            shared_prefix_tokens=shared_prefix_tokens,
+            max_input_tokens=longest_input,
+            total_input_tokens=total_input_tokens,
+            padded_input_tokens=padded_input_tokens,
+            padding_tokens=padded_input_tokens - total_input_tokens,
         )
 
     def status(self) -> dict[str, Any]:
@@ -258,6 +359,7 @@ class HFLogitBackend:
             "load_seconds": self.load_seconds,
             "max_options": 8,
             "max_input_tokens": self.max_input_tokens,
+            "question_execution": "shared_prefix_batch",
             "multimodal": True,
             "media_limits": {
                 "attachments": 8,

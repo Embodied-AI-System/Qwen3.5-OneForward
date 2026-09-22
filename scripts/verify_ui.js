@@ -12,6 +12,7 @@ const { chromium } = require(playwrightRoot);
 
 const baseUrl = process.env.ONEFORWARD_VERIFY_URL || "http://127.0.0.1:8000/";
 const screenshot = process.env.ONEFORWARD_SCREENSHOT || "docs/assets/playground.png";
+const mobileScreenshot = process.env.ONEFORWARD_MOBILE_SCREENSHOT || null;
 const onePixelPng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAZElEQVR4nO3PQQ3AIADAQEADH/x7Q8dE8Lgs6Slo5z17/NnSAa8a0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0D4XbAGTUCB/GwAAAABJRU5ErkJggg==",
   "base64",
@@ -47,8 +48,15 @@ const onePixelPng = Buffer.from(
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
     );
     assert(overflow <= 1, `mobile page overflows by ${overflow}px`);
+    if (mobileScreenshot) {
+      await page.screenshot({ path: mobileScreenshot, fullPage: true });
+    }
     assert.deepStrictEqual(errors, [], errors.join("\n"));
-    process.stdout.write(JSON.stringify({ baseUrl, screenshot, consoleErrors: errors }, null, 2));
+    process.stdout.write(JSON.stringify({
+      baseUrl,
+      screenshots: [screenshot, mobileScreenshot].filter(Boolean),
+      consoleErrors: errors,
+    }, null, 2));
   } finally {
     await browser.close();
   }

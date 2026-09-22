@@ -8,15 +8,39 @@
     <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
-    <main>
-      <header>
-        <div class="eyebrow">QWEN3.5-2B · ONE FORWARD · ZERO DECODE</div>
-        <h1>OneForward</h1>
-        <p>Map arbitrary semantic options to single tokens, then read the next-token logits directly.</p>
-        <div id="status" class="status">Model status: connecting…</div>
-      </header>
+    <div class="app-shell">
+      <aside class="history-panel" aria-label="Request history">
+        <div class="history-head">
+          <div><div class="eyebrow">RUN ARCHIVE</div><h2>History</h2></div>
+          <button id="history-refresh" class="icon-button" type="button" title="Refresh history" aria-label="Refresh history">↻</button>
+        </div>
+        <p class="history-caption">Requests, outputs, and inference metrics are saved automatically.</p>
+        <div id="history-list" class="history-list" aria-live="polite"></div>
+      </aside>
 
-      <section class="panel form-panel">
+      <main>
+        <header>
+          <div class="eyebrow">QWEN3.5-2B · ONE FORWARD · ZERO DECODE</div>
+          <h1>OneForward</h1>
+          <p>Map arbitrary semantic options to single tokens, then read the next-token logits directly.</p>
+          <div id="status" class="status">Model status: connecting…</div>
+        </header>
+
+        <section class="batch-mode" aria-labelledby="batch-mode-title">
+          <div class="batch-mode-icon">B</div>
+          <div>
+            <strong id="batch-mode-title">Shared-prefix batch inference</strong>
+            <p>Questions in one request share the same State and visual evidence, retain independent question and option suffixes, and run together in one left-padded model forward.</p>
+          </div>
+          <div id="batch-stats" class="batch-stats">Waiting for a run</div>
+        </section>
+
+        <nav class="mode-tabs" aria-label="Input mode">
+          <button class="active" data-mode="single" type="button">Single question</button>
+          <button data-mode="batch" type="button">Batch JSON</button>
+        </nav>
+
+      <section id="single-mode" class="panel form-panel">
         <label>
           <span>State</span>
           <textarea id="state" rows="5">Customer says the integration keeps failing. Please help ASAP.</textarea>
@@ -43,36 +67,38 @@
         </div>
         <div id="options"></div>
         <button id="run" class="run" type="button">Run one-forward decision</button>
-        <div id="error" class="error" hidden></div>
       </section>
 
-      <section id="results" class="panel results" hidden>
+      <section id="batch-mode" class="panel form-panel" hidden>
+        <div class="json-heading">
+          <div>
+            <div class="eyebrow">POST /v1/systemone</div>
+            <p>Put 2–64 Choice questions under <code>questions</code>. Their shared State is evaluated in one batch forward.</p>
+          </div>
+          <button id="load-batch-example" class="secondary" type="button">Load example</button>
+        </div>
+        <textarea id="batch-request" class="code-input" rows="25" spellcheck="false"></textarea>
+        <button id="run-batch" class="run" type="button">Run shared-prefix batch</button>
+      </section>
+
+      <div id="error" class="error" hidden></div>
+
+      <section id="results" class="results" hidden>
         <div class="result-title">
           <div>
-            <div class="eyebrow">DECISION</div>
-            <h2 id="choice"></h2>
+            <div class="eyebrow">DECISIONS</div>
+            <h2>Batch readout</h2>
           </div>
           <div id="latency" class="latency"></div>
         </div>
-        <div id="bars"></div>
-        <div class="metrics">
-          <div><span>candidate mass</span><strong id="mass"></strong></div>
-          <div><span>experimental confidence</span><strong id="confidence"></strong></div>
-          <div><span>input tokens</span><strong id="tokens"></strong></div>
-        </div>
+        <div id="answer-list"></div>
         <details>
-          <summary>Research debug data</summary>
-          <div class="debug-grid">
-            <div><h3>Candidate readout</h3><pre id="readout"></pre></div>
-            <div><h3>Top vocabulary tokens</h3><pre id="top-vocab"></pre></div>
-          </div>
-          <h3>Rendered prompt</h3>
-          <pre id="prompt"></pre>
-          <h3>Full response</h3>
+          <summary>Full API response</summary>
           <pre id="response"></pre>
         </details>
       </section>
-    </main>
+      </main>
+    </div>
     <script src="/static/app.js"></script>
   </body>
 </html>

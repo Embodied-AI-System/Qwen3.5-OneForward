@@ -20,7 +20,12 @@ token 的 logits。整个过程没有生成式解码、采样、微调、adapter
 ## 核心特点
 
 - **无需额外训练**：原样使用上游 Qwen3.5-2B 权重。
-- **不生成答案**：每个问题一次 forward，返回 `output_tokens: 0`。
+- **不生成答案**：同一请求内的所有问题合并成一次 batch forward，返回
+  `output_tokens: 0`。
+- **共享前缀问题批次**：最多 64 个 Choice 问题共享 State 与媒体输入，各自保留
+  独立的问题和选项后缀，左填充后在一个张量 batch 中执行。
+- **自动测试历史**：每个有效推理请求都会写入本地 SQLite，记录请求内容、输出、
+  每题读数及时间/token 指标；base64 媒体正文不会落盘。
 - **原生多模态证据**：每次请求最多加入 8 张图片或 1 个视频，视觉编码器与
   决策 prompt 共同参与同一次 forward。
 - **选项运行时定义**：请求中直接给出选项名称与语义，无固定分类头。
@@ -120,6 +125,32 @@ WebM、MOV、MKV 和 AVI。单张图片上限 16 MiB；视频上限 64 MiB、180
 默认按 1 FPS 且最多 32 帧采样。服务只在本地解码，返回值不会回显 base64，
 `_debug.media` 只包含尺寸、字节数、时长和采样帧数。
 
+同一请求内的多个 Choice 问题通过 `shared_prefix_batch` 模式只执行一次模型
+forward。这是张量 batching，会报告公共前缀 token 数与 padding 开销，但不宣称
+已经实现 paged-attention 或 KV prefix-cache 优化。每个有效请求都会返回 `id`，
+历史可通过 `GET /v1/history`、`GET /v1/history/{id}` 和
+`DELETE /v1/history/{id}` 查询或删除；网页左侧栏也可以直接打开既往结果。
+
+例如，同一个 `state` 可以在一次请求中并行询问团队和优先级：
+
+```json
+{
+  "state": "发布在今晚，webhook 返回 HTTP 500。",
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "哪个团队应该处理？",
+      "criteria": {"technical": "软件 bug 与集成", "sales": "定价与采购"}
+    },
+    "priority": {
+      "type": "choice",
+      "instructions": "这是什么优先级？",
+      "criteria": {"normal": "没有截止时间", "urgent": "有立即截止时间"}
+    }
+  }
+}
+```
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -131,6 +162,8 @@ WebM、MOV、MKV 和 AVI。单张图片上限 16 MiB；视频上限 64 MiB、180
 | `JEV_MAX_INPUT_TOKENS` | `8192` | 文本与视觉 token 的总上限 |
 | `JEV_VIDEO_FPS` | `1.0` | 视频目标采样率 |
 | `JEV_MAX_VIDEO_FRAMES` | `32` | 每个视频最多采样帧数 |
+| `JEV_HISTORY_PATH` | `.runtime/history.sqlite3` | 自动请求历史的 SQLite 文件 |
+| `JEV_HISTORY_RETENTION` | `500` | 最多保留的历史条数 |
 | `JEV_HOST` | `127.0.0.1` | 监听地址 |
 | `JEV_PORT` | `8000` | HTTP 端口 |
 | `JEV_PYTHON` | `python3` | `run.sh` 使用的 Python |
@@ -161,7 +194,8 @@ python -m compileall -q app.py core.py inference.py media.py tests scripts
 - 当前仅支持 2–8 个选项的 Choice；不支持 Noul、Score 或更大候选集。
 - 多模态输入需要默认的 chat prompt 模式；raw `Answer:` 基线仍只支持文本。
 - 每次请求最多 8 个媒体附件且最多 1 个视频；视频会抽帧，音频不会输入模型。
-- 多问题按顺序执行，暂未实现 batch 或共享 prefix cache。
+- 多问题通过一次左填充 batch forward 执行，并报告真实公共前缀 token 数和 padding
+  开销；当前仍未实现 KV prefix cache 复用。
 - 选项概率是允许标签集合内的条件概率，不是“答案正确”的校准概率。
 - `confidence = 1 - normalized_entropy(probabilities)` 只是实验性启发式公式，
   不是 Jev 的 confidence 实现。

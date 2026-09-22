@@ -12,8 +12,9 @@
 OneForward turns text, images, and video into typed decisions with the unchanged, open-weight
 [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) checkpoint into a small
 Jev-style decision service. It constructs a prompt, maps user-defined options to
-single-token labels (`A`–`H`), runs exactly one model forward pass for each
-Choice question, and reads the next-token logits directly. There is no decoding
+single-token labels (`A`–`H`), batches every question that shares the request's
+state and media into one model forward pass, and reads the next-token logits
+directly. There is no decoding
 loop, sampling, fine-tuning, adapter, or task-specific checkpoint.
 
 > [!IMPORTANT]
@@ -28,8 +29,14 @@ loop, sampling, fine-tuning, adapter, or task-specific checkpoint.
 ## Why this project
 
 - **No additional training.** It uses the upstream Qwen3.5-2B weights unchanged.
-- **No generated answer.** A request performs one prefill/forward per question and
+- **No generated answer.** A request performs one batched prefill/forward and
   returns `output_tokens: 0`.
+- **Shared-prefix question batches.** Up to 64 Choice questions with the same
+  state and media run as a single left-padded tensor batch with independent
+  question and option suffixes.
+- **Durable run history.** Every valid inference attempt is recorded in local
+  SQLite with request content, output, per-question readouts, and timing/token
+  metrics. Base64 media content is deliberately not stored.
 - **Native visual evidence.** Attach up to eight images or one video; Qwen's vision
   encoder participates in the same forward pass as the decision prompt.
 - **Runtime-defined labels.** Your option names and descriptions are supplied in
@@ -161,8 +168,35 @@ Example response, abbreviated from a real BF16 run:
 }
 ```
 
-Multiple Choice questions are accepted in one request, but this first version
-evaluates them sequentially—one model forward per question.
+Multiple Choice questions in one request are evaluated by one
+`shared_prefix_batch` model call. This is tensor batching: it exposes the actual
+common-prefix token count and padding cost, but does not claim a paged-attention
+or KV prefix-cache optimization.
+
+For example, the same `state` can drive two independent decisions in one call:
+
+```json
+{
+  "state": "The launch is tonight and the webhook returns HTTP 500.",
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {"technical": "Bugs and integrations", "sales": "Pricing"}
+    },
+    "priority": {
+      "type": "choice",
+      "instructions": "What priority is this?",
+      "criteria": {"normal": "No deadline", "urgent": "Immediate deadline"}
+    }
+  }
+}
+```
+
+Every valid request receives an `id` and is stored automatically. History is
+available through `GET /v1/history`, `GET /v1/history/{id}`, and
+`DELETE /v1/history/{id}`. The browser sidebar opens prior results and shows the
+recorded forward time, batch size, status, and timestamp.
 
 The browser playground supports selecting or dragging files with inline preview.
 The API accepts PNG, JPEG, WebP, GIF, MP4, WebM, MOV, MKV, and AVI data URLs.
@@ -182,6 +216,8 @@ frame count appear under `_debug.media`.
 | `JEV_MAX_INPUT_TOKENS` | `8192` | Maximum text-plus-vision token count |
 | `JEV_VIDEO_FPS` | `1.0` | Target video sampling rate |
 | `JEV_MAX_VIDEO_FRAMES` | `32` | Maximum sampled frames per video |
+| `JEV_HISTORY_PATH` | `.runtime/history.sqlite3` | SQLite file used for automatic request history |
+| `JEV_HISTORY_RETENTION` | `500` | Maximum retained history entries |
 | `JEV_HOST` | `127.0.0.1` | Bind address |
 | `JEV_PORT` | `8000` | HTTP port |
 | `JEV_PYTHON` | `python3` | Python executable used by `run.sh` |
@@ -218,7 +254,8 @@ post-training, RL, distillation, or calibration.
   text-only.
 - Each request accepts up to eight attachments and at most one video. Video is
   frame-sampled and audio is ignored.
-- Questions are not batched and do not share a prefix cache.
+- Question batches use one padded forward and report their common token prefix;
+  they do not yet reuse a KV prefix cache.
 - Candidate probabilities are conditional on the allowed labels and are not
   calibrated correctness probabilities.
 - `confidence = 1 - normalized_entropy(probabilities)` is an experimental
@@ -237,6 +274,7 @@ without domain-specific evaluation and human safeguards.
 app.py              FastAPI request/response layer
 core.py             prompt rendering and probability utilities
 inference.py        Qwen loading and final-position logits readout
+history.py          SQLite request, response, and performance history
 media.py            validated data-URL decoding and bounded video sampling
 web/                local research playground
 tests/              schema and tokenizer-invariant tests
@@ -245,7 +283,7 @@ scripts/smoke_test.py
 
 ## Contributing
 
-Bug reports, reproducible evaluations, calibration studies, batching work, and
+Bug reports, reproducible evaluations, calibration studies, prefix-cache work, and
 support for additional open models are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License and attribution

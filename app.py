@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from inference import HFLogitBackend, InputTooLongError
+from history import HistoryStore
 from media import MAX_ATTACHMENTS, MAX_VIDEO_BYTES, MediaInputError
 
 
@@ -68,7 +70,7 @@ class SystemOneRequest(BaseModel):
     state: Any
     model: str | None = None
     media: list[MediaInput] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
-    questions: dict[str, ChoiceQuestion] = Field(min_length=1)
+    questions: dict[str, ChoiceQuestion] = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def validate_media_mix(self) -> "SystemOneRequest":
@@ -77,17 +79,41 @@ class SystemOneRequest(BaseModel):
         return self
 
 
-def create_app(backend: Any | None = None) -> FastAPI:
+def history_request(request: SystemOneRequest) -> dict[str, Any]:
+    payload = request.model_dump(mode="json")
+    payload["media"] = [
+        {
+            "type": item.type,
+            "name": item.name,
+            "mime_type": item.data_url[5:].partition(";")[0],
+            "encoded_bytes": len(item.data_url),
+            "content_stored": False,
+        }
+        for item in request.media
+    ]
+    return payload
+
+
+def create_app(
+    backend: Any | None = None,
+    history_store: HistoryStore | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.backend = backend or await asyncio.to_thread(
             HFLogitBackend.from_environment
         )
+        app.state.history = history_store or HistoryStore(
+            os.environ.get(
+                "JEV_HISTORY_PATH", str(APP_DIR / ".runtime" / "history.sqlite3")
+            ),
+            retention=int(os.environ.get("JEV_HISTORY_RETENTION", "500")),
+        )
         yield
 
     app = FastAPI(
         title="OneForward",
-        version="0.2.0",
+        version="0.3.0",
         description=(
             "Multimodal Choice-only Jev-style experiment using Qwen3.5-2B next-token "
             "logits, without project-specific training or decoding."
@@ -104,38 +130,88 @@ def create_app(backend: Any | None = None) -> FastAPI:
     async def health() -> dict[str, Any]:
         return app.state.backend.status()
 
+    @app.get("/v1/history")
+    async def list_history(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="invalid history pagination")
+        return await asyncio.to_thread(
+            app.state.history.list, limit=limit, offset=offset
+        )
+
+    @app.get("/v1/history/{entry_id}")
+    async def get_history(entry_id: str) -> dict[str, Any]:
+        entry = await asyncio.to_thread(app.state.history.get, entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="history entry not found")
+        return entry
+
+    @app.delete("/v1/history/{entry_id}", status_code=204)
+    async def delete_history(entry_id: str) -> None:
+        deleted = await asyncio.to_thread(app.state.history.delete, entry_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="history entry not found")
+
     @app.post("/v1/systemone")
     async def system_one(request: SystemOneRequest) -> dict[str, Any]:
         started = time.perf_counter()
-        answers: dict[str, Any] = {}
-        input_tokens = 0
+        history_id = await asyncio.to_thread(
+            app.state.history.begin, history_request(request)
+        )
 
         try:
             prepared_media = await asyncio.to_thread(
                 app.state.backend.prepare_media, request.media
             )
         except MediaInputError as exc:
+            metrics = {"request_ms": (time.perf_counter() - started) * 1000.0}
+            await asyncio.to_thread(
+                app.state.history.fail,
+                history_id,
+                {"status_code": 422, "detail": str(exc)},
+                metrics,
+            )
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        # Questions intentionally run one-by-one in the MVP. No batching claim.
-        for question_id, question in request.questions.items():
-            criteria = list(question.criteria.items())
-            try:
-                result = await asyncio.to_thread(
-                    app.state.backend.score_choice,
-                    request.state,
-                    question.instructions,
-                    criteria,
-                    prepared_media,
-                )
-            except InputTooLongError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"inference failed for question {question_id!r}: {exc}",
-                ) from exc
+        question_items = list(request.questions.items())
+        jobs = [
+            {
+                "instructions": question.instructions,
+                "criteria": list(question.criteria.items()),
+            }
+            for _, question in question_items
+        ]
+        try:
+            batch = await asyncio.to_thread(
+                app.state.backend.score_batch,
+                request.state,
+                jobs,
+                media=prepared_media,
+            )
+        except InputTooLongError as exc:
+            metrics = {"request_ms": (time.perf_counter() - started) * 1000.0}
+            await asyncio.to_thread(
+                app.state.history.fail,
+                history_id,
+                {"status_code": 422, "detail": str(exc)},
+                metrics,
+            )
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            metrics = {"request_ms": (time.perf_counter() - started) * 1000.0}
+            detail = f"batch inference failed: {exc}"
+            await asyncio.to_thread(
+                app.state.history.fail,
+                history_id,
+                {"status_code": 500, "detail": detail},
+                metrics,
+            )
+            raise HTTPException(status_code=500, detail=detail) from exc
 
+        answers: dict[str, Any] = {}
+        for batch_index, ((question_id, question), result) in enumerate(
+            zip(question_items, batch.decisions)
+        ):
+            criteria = list(question.criteria.items())
             names = [name for name, _ in criteria]
             selected_name = names[result.selected_index]
             answers[question_id] = {
@@ -162,29 +238,66 @@ def create_app(backend: Any | None = None) -> FastAPI:
                     "top_vocabulary": list(result.top_vocabulary),
                     "prompt": result.prompt,
                     "media": list(result.media),
+                    "batch_index": batch_index,
                 },
             }
-            input_tokens += result.input_tokens
 
         backend_status = app.state.backend.status()
-        return {
+        batch_metrics = {
+            "mode": "shared_prefix_batch",
+            "batch_size": batch.batch_size,
+            "model_forward_count": 1,
+            "shared_prefix_tokens": batch.shared_prefix_tokens,
+            "preprocess_ms": batch.preprocess_ms,
+            "queue_ms": batch.queue_ms,
+            "forward_ms": batch.inference_ms,
+            "max_input_tokens": batch.max_input_tokens,
+            "total_input_tokens": batch.total_input_tokens,
+            "padded_input_tokens": batch.padded_input_tokens,
+            "padding_tokens": batch.padding_tokens,
+        }
+        request_ms = (time.perf_counter() - started) * 1000.0
+        response = {
+            "id": history_id,
             "model": backend_status["model"],
             "answers": answers,
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            "usage": {"input_tokens": batch.total_input_tokens, "output_tokens": 0},
             "_compat": {
                 "schema_scope": "choice-only",
                 "semantic_compatibility": False,
                 "confidence_method": "one_minus_normalized_entropy_experimental",
                 "requested_model": request.model,
                 "prompt_mode": backend_status.get("prompt_mode"),
+                "question_execution": "shared_prefix_batch",
+                "batch_semantics": (
+                    "one padded model forward over questions sharing state and media; "
+                    "each question has an independent decision suffix"
+                ),
                 "multimodal_input": True,
             },
             "_debug": {
-                "request_ms": (time.perf_counter() - started) * 1000.0,
-                "questions_evaluated_sequentially": True,
+                "request_ms": request_ms,
+                "batch": batch_metrics,
                 "media_count": len(prepared_media),
             },
         }
+        history_metrics = {
+            "request_ms": request_ms,
+            **batch_metrics,
+            "questions": {
+                question_id: {
+                    "type": "choice",
+                    "input_tokens": answer["_debug"]["input_tokens"],
+                    "candidate_mass": answer["_debug"]["candidate_mass"],
+                    "confidence": answer["confidence"],
+                }
+                for question_id, answer in answers.items()
+            },
+        }
+        await asyncio.to_thread(
+            app.state.history.complete, history_id, response, history_metrics
+        )
+        return response
 
     return app
 

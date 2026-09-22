@@ -24,7 +24,7 @@ Thanks for helping improve OneForward.
 
 - controlled option-order and label-token bias evaluation
 - calibration studies on public labeled datasets
-- safe batching and shared-prefix caching
+- KV prefix caching and batch scheduling improvements
 - additional model backends with explicit tokenizer-invariant tests
 - Noul and Score research implementations with clearly documented semantics
 - accessibility, documentation, and reproducibility improvements
